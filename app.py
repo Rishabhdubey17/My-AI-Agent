@@ -2,12 +2,13 @@ import os
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from langchain_groq import ChatGroq
-from langchain_tavily import TavilySearch
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_community.tools import DuckDuckGoSearchRun
 
 load_dotenv()
 
@@ -20,72 +21,101 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-groq_key = os.getenv("GROQ_API_KEY")
-tavily_key = os.getenv("TAVILY_API_KEY")
+os.makedirs("static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Updated to an active Groq model ID
+
+@app.get("/")
+async def serve_frontend():
+    index_path = "static/index.html"
+    if os.path.exists(index_path):
+        return FileResponse(index_path, media_type="text/html")
+    raise HTTPException(status_code=404, detail="static/index.html not found")
+
+
+@app.get("/manifest.json")
+async def serve_manifest():
+    manifest_path = "static/manifest.json"
+    if os.path.exists(manifest_path):
+        return FileResponse(manifest_path, media_type="application/manifest+json")
+    raise HTTPException(status_code=404, detail="static/manifest.json not found")
+
+
+@app.get("/sw.js")
+async def serve_sw():
+    sw_path = "static/sw.js"
+    if os.path.exists(sw_path):
+        return FileResponse(sw_path, media_type="application/javascript")
+    raise HTTPException(status_code=404, detail="static/sw.js not found")
+
+
+search_tool = DuckDuckGoSearchRun()
+groq_key = os.getenv("GROQ_API_KEY")
+
+if not groq_key:
+    raise RuntimeError("GROQ_API_KEY environment variable is missing.")
+
+# Replace with an active chat model ID from your Groq Console if needed
 llm = ChatGroq(
-    model="llama-3.1-8b-instant",  # Active replacement model on Groq
+    model="openai/gpt-oss-20b",
     temperature=0.2,
-    api_key=groq_key
+    api_key=groq_key,
 )
 
-# Initialize Tavily Search
-search_tool = TavilySearch(max_results=3)
-tools = [search_tool]
-tools_by_name = {tool.name: tool for tool in tools}
-
-llm_with_tools = llm.bind_tools(tools)
 
 class MessageRequest(BaseModel):
     message: str
 
+
+GREETINGS = {
+    "hi", "hii", "hiii", "hello", "hey", "yo", "sup",
+    "good morning", "good evening", "good night"
+}
+
+
 @app.post("/api/chat")
 async def chat_endpoint(request: MessageRequest):
     try:
-        today_str = datetime.now().strftime("%B %d, %Y")
+        msg = request.message.strip()
+        if not msg:
+            raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-        messages = [
-            SystemMessage(
-                content=(
-                    f"You are PRIME, an intelligent AI assistant. Today's date is {today_str}.\n"
-                    "1. You have live real-time web search capabilities via Tavily.\n"
-                    "2. ALWAYS invoke the search tool for questions regarding current news, events, dates, or your knowledge cutoff."
-                )
-            ),
-            HumanMessage(content=request.message)
-        ]
+        current_year = datetime.now().year
+        is_greeting = msg.lower().rstrip("!.?") in GREETINGS
 
-        ai_msg = llm_with_tools.invoke(messages)
+        if is_greeting:
+            prompt = (
+                f"Current Year: {current_year}\n"
+                f"User says: {msg}\n"
+                "Reply warmly and briefly as PRIME AI."
+            )
+            response = llm.invoke(prompt)
+            return {"reply": response.content}
 
-        if hasattr(ai_msg, "tool_calls") and ai_msg.tool_calls:
-            messages.append(ai_msg)
-            
-            for tool_call in ai_msg.tool_calls:
-                tool_name = tool_call["name"]
-                tool_args = tool_call.get("args", {})
-                
-                if tool_name in tools_by_name:
-                    selected_tool = tools_by_name[tool_name]
-                    
-                    try:
-                        tool_output = selected_tool.invoke(tool_args)
-                    except Exception as err:
-                        tool_output = f"Search currently unavailable: {str(err)}"
-                    
-                    messages.append(
-                        ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"])
-                    )
-            
-            final_res = llm_with_tools.invoke(messages)
-            return {"reply": final_res.content}
+        search_query = f"{msg} {current_year}"
+        try:
+            search_results = search_tool.run(search_query)
+        except Exception as search_err:
+            search_results = f"Search unavailable ({str(search_err)})."
 
-        return {"reply": ai_msg.content}
+        if not search_results or not str(search_results).strip():
+            search_results = "No web snippets returned."
 
+        prompt = (
+            f"Current Year: {current_year}\n"
+            f"User Query: {msg}\n\n"
+            f"Web Context:\n{search_results}\n\n"
+            "INSTRUCTIONS:\n"
+            "- Use the web context when relevant for current/recent facts.\n"
+            "- Never mention a 2023 knowledge cutoff.\n"
+            "- Be clear and helpful."
+        )
+
+        response = llm.invoke(prompt)
+        return {"reply": response.content}
+
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Server Error: {str(e)}")
-        try:
-            fallback_res = llm.invoke(request.message)
-            return {"reply": fallback_res.content}
-        except Exception as final_err:
-            raise HTTPException(status_code=500, detail=str(final_err))
+        raise HTTPException(status_code=500, detail=f"Backend error: {str(e)}")
